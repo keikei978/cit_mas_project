@@ -1,0 +1,222 @@
+# -*- coding: utf-8 -*-
+"""
+噂拡散モデル (C-3 問い15: 口コミ vs 広告 比較実験)
+
+3条件のシミュレーションを各 N_TRIALS 回ずつ走らせ、平均±標準偏差で比較する。
+- 条件A: 口コミのみ (Word-of-Mouth only)
+- 条件B: 広告のみ (Advertising only)
+- 条件C: 両方併用 (Mixed)
+
+出力:
+- 3条件並列の時系列プロット (PNG)
+- 最終統計の表 (標準出力)
+
+「同じ予算」の解釈:
+  WoM は接触ごとに p_spread の確率で1人を変換、
+  広告は1ステップあたり期待 ad_rate 人を変換。
+  条件Cは両者を半分ずつにすることでざっくり同程度の入力にしている。
+  パラメータを動かして比較条件を調整できる。
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+import os
+
+# ========== 共通パラメータ ==========
+WIDTH = 50
+HEIGHT = 50
+AGENTS_NUMBER = 300
+INITIAL_SPREADER_NUMBER = 1
+INTERACTION_RADIUS = 3.0
+STIFLING_PROBABILITY = 0.05
+SIMULATION_TIME = 200
+AGENT_SPEED = 1.0
+N_TRIALS = 10  # 各条件で何回試行するか
+
+# 状態の定義
+SUSCEPTIBLE = 0
+SPREADER = 1
+STIFLER = 2
+
+
+# ========== エージェント ==========
+class Agent:
+    def __init__(self, x, y, state):
+        self.x = x
+        self.y = y
+        self.state = state
+
+    def move(self):
+        angle = np.random.rand() * 2 * np.pi
+        self.x += AGENT_SPEED * np.cos(angle)
+        self.y += AGENT_SPEED * np.sin(angle)
+        self.x = max(0, min(self.x, WIDTH))
+        self.y = max(0, min(self.y, HEIGHT))
+
+
+def initialize_simulation():
+    agents = []
+    for _ in range(AGENTS_NUMBER):
+        x = np.random.rand() * WIDTH
+        y = np.random.rand() * HEIGHT
+        agents.append(Agent(x, y, SUSCEPTIBLE))
+    spreader_indices = np.random.choice(AGENTS_NUMBER, INITIAL_SPREADER_NUMBER, replace=False)
+    for i in spreader_indices:
+        agents[i].state = SPREADER
+    return agents
+
+
+# ========== 相互作用判定 ==========
+def check_spreading(spreader, other, p_spread):
+    """口コミ拡散 (S → I)"""
+    if other.state == SUSCEPTIBLE:
+        distance = np.sqrt((spreader.x - other.x)**2 + (spreader.y - other.y)**2)
+        if distance < INTERACTION_RADIUS and np.random.rand() < p_spread:
+            other.state = SPREADER
+
+
+def check_stifling(spreader, other):
+    """飽き (I → R)"""
+    if other.state == SPREADER or other.state == STIFLER:
+        distance = np.sqrt((spreader.x - other.x)**2 + (spreader.y - other.y)**2)
+        if distance < INTERACTION_RADIUS and np.random.rand() < STIFLING_PROBABILITY:
+            spreader.state = STIFLER
+
+
+def advertising_step(agents, ad_rate):
+    """広告: 平均 ad_rate 人の S をランダムに I に変える(空間に依存しない)"""
+    n_ads = np.random.poisson(ad_rate)
+    if n_ads == 0:
+        return
+    susceptibles = [a for a in agents if a.state == SUSCEPTIBLE]
+    if not susceptibles:
+        return
+    n_actual = min(n_ads, len(susceptibles))
+    chosen = np.random.choice(len(susceptibles), n_actual, replace=False)
+    for idx in chosen:
+        susceptibles[idx].state = SPREADER
+
+
+# ========== シミュレーション本体 ==========
+def run_simulation(p_spread, ad_rate):
+    """1試行: 各時刻の S, I, R 数を返す"""
+    counts_S, counts_I, counts_R = [], [], []
+    agents = initialize_simulation()
+
+    for frame in range(SIMULATION_TIME):
+        # 移動
+        for agent in agents:
+            agent.move()
+
+        # 口コミ拡散と飽き
+        for i, agent1 in enumerate(agents):
+            if agent1.state == SPREADER:
+                for j, agent2 in enumerate(agents):
+                    if i == j:
+                        continue
+                    if agent1.state != SPREADER:
+                        break
+                    if agent2.state == SUSCEPTIBLE:
+                        check_spreading(agent1, agent2, p_spread)
+                    else:
+                        check_stifling(agent1, agent2)
+
+        # 広告
+        if ad_rate > 0:
+            advertising_step(agents, ad_rate)
+
+        counts_S.append(sum(1 for a in agents if a.state == SUSCEPTIBLE))
+        counts_I.append(sum(1 for a in agents if a.state == SPREADER))
+        counts_R.append(sum(1 for a in agents if a.state == STIFLER))
+
+    return np.array(counts_S), np.array(counts_I), np.array(counts_R)
+
+
+def run_trials(p_spread, ad_rate, n_trials):
+    """複数回試行: shape (n_trials, SIMULATION_TIME) で返す"""
+    all_S, all_I, all_R = [], [], []
+    for trial in range(n_trials):
+        s, i, r = run_simulation(p_spread, ad_rate)
+        all_S.append(s); all_I.append(i); all_R.append(r)
+        print(f'  trial {trial+1}/{n_trials}: final S={s[-1]}, R={r[-1]}')
+    return np.array(all_S), np.array(all_I), np.array(all_R)
+
+
+# ========== 3条件の定義 ==========
+conditions = [
+    {"name": "A: WoM only",       "p_spread": 0.10, "ad_rate": 0.0},
+    {"name": "B: Ads only",       "p_spread": 0.00, "ad_rate": 1.0},
+    {"name": "C: Mixed (both)",   "p_spread": 0.05, "ad_rate": 0.5},
+]
+
+
+# ========== 実行 ==========
+results = []
+for cond in conditions:
+    print(f"\n=== Running {cond['name']} (p_spread={cond['p_spread']}, ad_rate={cond['ad_rate']}) ===")
+    all_S, all_I, all_R = run_trials(cond['p_spread'], cond['ad_rate'], N_TRIALS)
+    results.append({
+        "name": cond['name'],
+        "S_mean": all_S.mean(axis=0), "S_std": all_S.std(axis=0),
+        "I_mean": all_I.mean(axis=0), "I_std": all_I.std(axis=0),
+        "R_mean": all_R.mean(axis=0), "R_std": all_R.std(axis=0),
+    })
+
+
+# ========== 描画 ==========
+fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+time = np.arange(SIMULATION_TIME)
+
+for ax, res in zip(axes, results):
+    ax.plot(time, res['S_mean'], label='Susceptible', color='blue')
+    ax.fill_between(time, res['S_mean']-res['S_std'], res['S_mean']+res['S_std'],
+                    color='blue', alpha=0.2)
+    ax.plot(time, res['I_mean'], label='Spreader', color='red')
+    ax.fill_between(time, res['I_mean']-res['I_std'], res['I_mean']+res['I_std'],
+                    color='red', alpha=0.2)
+    ax.plot(time, res['R_mean'], label='Stifler', color='green')
+    ax.fill_between(time, res['R_mean']-res['R_std'], res['R_mean']+res['R_std'],
+                    color='green', alpha=0.2)
+    ax.set_title(res['name'])
+    ax.set_xlabel('Time')
+    ax.set_xlim(0, SIMULATION_TIME)
+    ax.set_ylim(0, AGENTS_NUMBER)
+    ax.legend(loc='center right')
+    ax.grid(True)
+
+axes[0].set_ylabel('Number of Agents')
+plt.suptitle(f'WoM vs Advertising Comparison (n_trials = {N_TRIALS})', fontsize=14)
+plt.tight_layout()
+
+# PNG 保存
+now = datetime.datetime.now()
+filename = 'rumor_advertising_comparison_' + now.strftime('%Y%m%d_%H%M%S') + '.png'
+save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+plt.savefig(save_path, dpi=100)
+print(f'\nPlot saved to: {save_path}')
+
+
+# ========== 最終統計の出力 ==========
+print("\n" + "="*80)
+print("Final Statistics (mean ± std over trials)")
+print("="*80)
+header = f"{'Condition':<20} {'Final S':<18} {'Final R':<18} {'Peak I':<12} {'Peak time':<10}"
+print(header)
+print("-"*80)
+for res in results:
+    final_S = res['S_mean'][-1]
+    final_S_std = res['S_std'][-1]
+    final_R = res['R_mean'][-1]
+    final_R_std = res['R_std'][-1]
+    peak_I = res['I_mean'].max()
+    peak_t = int(res['I_mean'].argmax())
+    line = f"{res['name']:<20} {final_S:6.1f} ± {final_S_std:5.1f}    {final_R:6.1f} ± {final_R_std:5.1f}    {peak_I:6.1f}      t={peak_t}"
+    print(line)
+print("="*80)
+print("\n読み方:")
+print("  Final R が大きい = 結果として多くの人に届いた(=広く拡散できた)")
+print("  Final S が大きい = 多くの人に届かなかった(=届かなかった人が多い)")
+print("  Peak I が高い = 一時的に話題になった人数のピーク")
+
+plt.show()
